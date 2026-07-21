@@ -31,6 +31,14 @@ class Entry(BaseModel):
     signature: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     nonce: int = 0
+    # Monotonic, strictly-increasing per-row sequence assigned by the storage
+    # backend (Postgres GENERATED ALWAYS AS IDENTITY). It is NOT supplied by the
+    # caller on append and is NOT part of the signed hash input (see to_dict --
+    # seq_no is deliberately excluded so that adding this column does not change
+    # any previously computed hash and all existing entries stay verifiable).
+    # It exists purely for deterministic ordering and tail-truncation detection.
+    # None until the row has been persisted and read back.
+    seq_no: Optional[int] = None
 
     @field_validator("data")
     @classmethod
@@ -39,9 +47,17 @@ class Entry(BaseModel):
         if not v:
             raise ValueError("Entry data cannot be empty")
         return v
-    
+
     def to_dict(self) -> Dict[str, Any]:
-        """Convert entry to dictionary."""
+        """Convert entry to dictionary.
+
+        NOTE: seq_no is intentionally NOT included here. to_dict() feeds the
+        hash chain (HashChain.calculate_hash hashes to_dict() minus hash and
+        signature). Keeping seq_no out of this dict is the deliberate, reversible
+        ARCH decision that lets us add the monotonic sequence column WITHOUT
+        invalidating any entry hashed before the column existed. Tail-truncation
+        is detected via the seq stream / checkpoint, not via the hash chain.
+        """
         return {
             "id": self.id,
             "timestamp": self.timestamp.isoformat(),
@@ -316,24 +332,26 @@ class Ledger:
             IntegrityError: If integrity check fails
         """
         logger.info("Starting integrity verification...")
-        
+
         previous_hash = None
+        previous_seq: Optional[int] = None
         entry_count = 0
-        
-        # Get entry iterator
+
+        # Get entry iterator (backend yields in strict seq order).
         entries = self.backend.get_entries()
-        
+
         # Skip to start entry if specified
         if start_entry:
             for entry in entries:
                 if entry.id == start_entry:
                     break
                 previous_hash = entry.hash
-        
+                previous_seq = getattr(entry, "seq_no", None)
+
         # Verify each entry
         for entry in entries:
             entry_count += 1
-            
+
             # Verify previous hash link
             if entry.previous_hash != previous_hash:
                 raise IntegrityError(
@@ -342,7 +360,7 @@ class Ledger:
                     expected_hash=previous_hash,
                     actual_hash=entry.previous_hash,
                 )
-            
+
             # Verify entry hash
             calculated_hash = self.hash_chain.calculate_hash(entry)
             if entry.hash != calculated_hash:
@@ -352,16 +370,106 @@ class Ledger:
                     expected_hash=calculated_hash,
                     actual_hash=entry.hash,
                 )
-            
+
+            # Verify the monotonic sequence is strictly increasing. A duplicate
+            # or out-of-order seq means rows were reordered or re-inserted; a
+            # backwards step is impossible under GENERATED ALWAYS AS IDENTITY, so
+            # observing one is itself evidence of tampering.
+            current_seq = getattr(entry, "seq_no", None)
+            if current_seq is not None and previous_seq is not None:
+                if current_seq <= previous_seq:
+                    raise IntegrityError(
+                        f"Sequence not strictly increasing at entry {entry.id} "
+                        f"(seq {current_seq} <= previous {previous_seq})",
+                        entry_id=entry.id,
+                    )
+            if current_seq is not None:
+                previous_seq = current_seq
+
             # Update for next iteration
             previous_hash = entry.hash
-            
+
             # Stop at end entry if specified
             if end_entry and entry.id == end_entry:
                 break
-        
+
+        # Whole-ledger scan only: detect tail-truncation. The hash chain cannot
+        # see deletion of the NEWEST rows (the surviving tail is still internally
+        # consistent), so we cross-check the seq stream and the latest persisted
+        # checkpoint. Skipped when a bounded sub-range was requested.
+        if not start_entry and not end_entry:
+            self._verify_no_tail_truncation(entry_count)
+
         logger.info(f"Integrity verification complete. Verified {entry_count} entries.")
         return True
+
+    def _verify_no_tail_truncation(self, verified_count: int) -> None:
+        """Detect deletion of the newest rows using the seq stream + checkpoint.
+
+        Two independent signals, used when the backend exposes them:
+
+        1. Seq stream: for a contiguous append-only ledger,
+           (max_seq - min_seq + 1) must equal the row count. A gap means rows
+           were removed from the MIDDLE or the TAIL.
+
+        2. Persisted checkpoint: if the latest stored checkpoint recorded a
+           higher total_entries or max_seq than we now observe, the newest rows
+           were deleted (tail-truncation) -- which a pure seq-contiguity check
+           cannot catch if the truncated tail leaves a still-contiguous prefix.
+
+        Raises IntegrityError on either signal. No-ops for backends (e.g.
+        InMemoryBackend) that do not expose these helpers.
+        """
+        summary = None
+        if hasattr(self.backend, "get_seq_summary"):
+            try:
+                summary = self.backend.get_seq_summary()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(f"Could not read seq summary: {exc}")
+
+        if summary and summary.get("count"):
+            count = summary["count"]
+            min_seq = summary["min_seq"]
+            max_seq = summary["max_seq"]
+            if min_seq is not None and max_seq is not None:
+                expected_span = max_seq - min_seq + 1
+                if expected_span != count:
+                    raise IntegrityError(
+                        "Sequence gap detected: rows are missing "
+                        f"(span {expected_span} != count {count}); "
+                        "the ledger was truncated or rows were deleted.",
+                    )
+
+        if hasattr(self.backend, "get_latest_checkpoint"):
+            try:
+                checkpoint = self.backend.get_latest_checkpoint()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(f"Could not read latest checkpoint: {exc}")
+                checkpoint = None
+
+            if checkpoint:
+                stored_total = checkpoint.get("total_entries")
+                stored_max_seq = checkpoint.get("max_seq")
+                observed_total = (
+                    summary["count"] if summary else self.backend.count_entries()
+                )
+                if stored_total is not None and observed_total < stored_total:
+                    raise IntegrityError(
+                        "Tail-truncation detected: current entry count "
+                        f"{observed_total} is lower than the last signed "
+                        f"checkpoint total {stored_total}.",
+                    )
+                observed_max_seq = summary["max_seq"] if summary else None
+                if (
+                    stored_max_seq is not None
+                    and observed_max_seq is not None
+                    and observed_max_seq < stored_max_seq
+                ):
+                    raise IntegrityError(
+                        "Tail-truncation detected: current max sequence "
+                        f"{observed_max_seq} is lower than the last signed "
+                        f"checkpoint max sequence {stored_max_seq}.",
+                    )
     
     def verify_entry(self, entry_id: str) -> bool:
         """Verify a single entry.
