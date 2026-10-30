@@ -202,41 +202,47 @@ class Ledger:
             StorageError: If storage operation fails
         """
         with self._write_lock:
-            # Get previous hash
-            previous_hash = None
+            build_failures: List[BaseException] = []
+
+            def build_entry(previous_hash: Optional[str]) -> Entry:
+                try:
+                    return _build(previous_hash)
+                except BaseException as exc:
+                    build_failures.append(exc)
+                    raise
+
+            def _build(previous_hash: Optional[str]) -> Entry:
+                # Create entry
+                entry = Entry(
+                    data=data,
+                    metadata=metadata or {},
+                    previous_hash=previous_hash,
+                )
+
+                # Calculate hash
+                entry_dict = entry.to_dict()
+                entry_dict["hash"] = self.hash_chain.calculate_hash(entry)
+
+                # Sign if requested or if signatures are enabled
+                if sign or self.enable_signatures:
+                    if not signer:
+                        raise ValidationError("Signer function required for signing")
+                    entry_dict["signature"] = signer(entry_dict["hash"])
+
+                return Entry.from_dict(entry_dict)
+
+            # Read the tip, build and store in one backend step. The backend
+            # makes this atomic across processes where it can (PostgreSQL:
+            # advisory lock + one transaction); self._write_lock only
+            # serialises threads of this process.
             try:
-                last_entry = self.backend.get_latest_entry()
-                if last_entry:
-                    previous_hash = last_entry.hash
+                final_entry = self.backend.append_chained(build_entry)
             except Exception as e:
-                logger.warning(f"Failed to get last entry: {e}")
-            
-            # Create entry
-            entry = Entry(
-                data=data,
-                metadata=metadata or {},
-                previous_hash=previous_hash,
-            )
-            
-            # Calculate hash
-            entry_dict = entry.to_dict()
-            entry_dict["hash"] = self.hash_chain.calculate_hash(entry)
-            
-            # Sign if requested or if signatures are enabled
-            if sign or self.enable_signatures:
-                if not signer:
-                    raise ValidationError("Signer function required for signing")
-                entry_dict["signature"] = signer(entry_dict["hash"])
-            
-            # Create final entry
-            final_entry = Entry.from_dict(entry_dict)
-            
-            # Store entry
-            try:
-                self.backend.append_entry(final_entry)
-            except Exception as e:
+                if build_failures and e is build_failures[-1]:
+                    # Hashing or signing failed, not storage: surface as before.
+                    raise
                 raise StorageError(f"Failed to append entry: {e}", "append", self.backend.name)
-            
+
             # Update cache
             with self._lock:
                 self._add_to_cache(final_entry)
