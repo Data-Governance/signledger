@@ -9,6 +9,7 @@ points at a disposable PostgreSQL database.
 import logging
 import os
 import threading
+import uuid
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -340,7 +341,7 @@ def test_default_append_chained_tolerates_tip_read_failure(caplog):
 )
 def test_two_appenders_real_postgres_keep_a_single_chain():
     dsn = os.environ["SIGNLEDGER_TEST_PG_DSN"]
-    table = "sl_atomic_test"
+    table = f"sl_atomic_{uuid.uuid4().hex[:8]}"
     # Separate backends and Ledgers share no in-process lock, like two tasks.
     ledgers = [
         Ledger(backend=PostgreSQLBackend(dsn, table_name=table), auto_verify=False)
@@ -364,4 +365,4 @@ def test_two_appenders_real_postgres_keep_a_single_chain():
     entries = list(ledgers[0].backend.get_entries())
     assert len(entries) == 50
     assert len({e.previous_hash for e in entries}) == 50
-    assert ledgers[0].verify_integrity().is_valid
+    assert ledgers[0].verify_integrity() is True

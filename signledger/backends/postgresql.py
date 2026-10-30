@@ -424,6 +424,14 @@ class PostgreSQLBackend(StorageBackend):
         appenders in other processes or tasks wait on the database, not on the
         per-process lock. If the unique index still fires (a race that slipped
         through), retry once in a new transaction and log both seq numbers.
+
+        Seq gap after a retry: the rejected insert still consumed one identity
+        value, so seq skips by one and verify_integrity reports a sequence gap.
+        The truncation check is deliberately not weakened. Under the advisory
+        lock a violation can only come from an appender that does not hold the
+        lock (for example an older library version during a rolling deploy).
+        The retry logs both seq numbers at WARNING: a single-value gap that
+        matches a logged retry is explained; any other gap is truncation.
         """
         try:
             return self._append_chained_once(build_entry)
