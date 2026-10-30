@@ -2,10 +2,13 @@
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional, List, Iterator, Dict, Any
+from typing import Optional, List, Iterator, Dict, Any, Callable
 import json
+import logging
 
 from ..core.exceptions import StorageError
+
+logger = logging.getLogger(__name__)
 
 
 class StorageBackend(ABC):
@@ -15,6 +18,30 @@ class StorageBackend(ABC):
         self.name = self.__class__.__name__
         self._config = kwargs
     
+    def append_chained(self, build_entry: Callable[[Optional[str]], Any]) -> Any:
+        """Read the chain tip, build the next entry from it, and append it.
+
+        ``build_entry`` receives the tip hash (None for genesis) and returns the
+        finished entry (hash and signature included). The default is the
+        original read-then-insert, serialised only by the caller's in-process
+        lock. Backends with real transactions override this to make the whole
+        step atomic across processes.
+
+        TODO(SEC-SWEEP-2 item 24): sqlite, mongodb and memory backends keep the
+        per-process guarantee only; give them a cross-process lock if they are
+        ever used by more than one writer process.
+        """
+        previous_hash = None
+        try:
+            last_entry = self.get_latest_entry()
+            if last_entry:
+                previous_hash = last_entry.hash
+        except Exception as e:
+            logger.warning(f"Failed to get last entry: {e}")
+        entry = build_entry(previous_hash)
+        self.append_entry(entry)
+        return entry
+
     @abstractmethod
     def append_entry(self, entry: Any) -> None:
         """Append an entry to the ledger.

@@ -2,8 +2,11 @@
 
 from datetime import datetime
 from typing import Optional, Iterator, Dict, Any
+import hashlib
 import json
 import logging
+import struct
+from typing import Callable
 
 try:
     import psycopg2
@@ -25,6 +28,10 @@ from ..core.exceptions import StorageError
 from ..core.ledger import Entry
 
 logger = logging.getLogger(__name__)
+
+
+class _ChainConflict(Exception):
+    """Raised inside a transaction when another writer took the same tip."""
 
 
 class PostgreSQLBackend(StorageBackend):
@@ -60,6 +67,8 @@ class PostgreSQLBackend(StorageBackend):
 
         # Create table if it doesn't exist
         self.create_indexes()
+        # One successor per entry: forks are rejected by the database.
+        self._create_chain_unique_index()
         # Append-only enforcement at the DB level (REVOKE + trigger) and the
         # checkpoint table. Idempotent; safe to run on every startup.
         self._apply_immutability_guards()
@@ -375,6 +384,156 @@ class PostgreSQLBackend(StorageBackend):
                 }
         finally:
             self._put_connection(conn)
+
+    @property
+    def chain_index_name(self) -> str:
+        """Name of the unique index that forbids two successors of one entry."""
+        return f"uq_{self.table_name}_previous_hash"
+
+    def advisory_lock_key(self) -> int:
+        """Signed 64-bit key for pg_advisory_xact_lock, derived from the table.
+
+        Stable across processes and restarts (sha256, not hash()), distinct per
+        ledger table, so appenders to one ledger serialise on the database.
+        """
+        digest = hashlib.sha256(
+            f"signledger.append:{self.table_name}".encode("utf-8")
+        ).digest()
+        return struct.unpack(">q", digest[:8])[0]
+
+    def _create_chain_unique_index(self) -> None:
+        """Make a fork impossible at the database (SEC-SWEEP-2 item 24).
+
+        UNIQUE on COALESCE(previous_hash, 'GENESIS'): every non-genesis entry
+        may be the predecessor of exactly one row, and the genesis row (stored
+        with previous_hash NULL, which a plain unique index would let repeat)
+        is unique too. A real hash is 64 hex characters, so the sentinel cannot
+        collide. One ledger per table, so no per-ledger scoping is needed.
+        Idempotent. On a table that already holds a fork this raises at boot,
+        which is the correct outcome: the chain needs a human.
+        """
+        self._execute_ddl([
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {self.chain_index_name} "
+            f"ON {self.table_name} ((COALESCE(previous_hash, 'GENESIS')))"
+        ])
+
+    def append_chained(self, build_entry: Callable[[Optional[str]], Entry]) -> Entry:
+        """Read the tip and insert the successor in ONE transaction.
+
+        The transaction first takes pg_advisory_xact_lock(<table key>), so
+        appenders in other processes or tasks wait on the database, not on the
+        per-process lock. If the unique index still fires (a race that slipped
+        through), retry once in a new transaction and log both seq numbers.
+        """
+        try:
+            return self._append_chained_once(build_entry)
+        except _ChainConflict as first:
+            tip = self.get_latest_entry()
+            logger.warning(
+                "Chain fork rejected by %s: tip seq was %s, now %s; retrying append once",
+                self.chain_index_name,
+                first.args[0] if first.args else None,
+                tip.seq_no if tip else None,
+            )
+            try:
+                return self._append_chained_once(build_entry)
+            except _ChainConflict as second:
+                raise StorageError(
+                    f"Failed to append entry: chain conflict persisted after retry "
+                    f"(tip seq {second.args[0] if second.args else None})",
+                    "append",
+                    self.name,
+                )
+
+    def _append_chained_once(self, build_entry: Callable[[Optional[str]], Entry]) -> Entry:
+        if self.use_sqlalchemy:
+            return self._append_chained_sqlalchemy(build_entry)
+        return self._append_chained_psycopg2(build_entry)
+
+    def _is_chain_violation(self, exc: Exception) -> bool:
+        diag = getattr(getattr(exc, "orig", exc), "diag", None)
+        return getattr(diag, "constraint_name", None) == self.chain_index_name
+
+    def _append_chained_psycopg2(self, build_entry: Callable[[Optional[str]], Entry]) -> Entry:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (self.advisory_lock_key(),))
+                cur.execute(
+                    f"SELECT hash, seq FROM {self.table_name} ORDER BY seq DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                previous_hash, tip_seq = (row[0], row[1]) if row else (None, None)
+                entry = build_entry(previous_hash)
+                try:
+                    cur.execute(f"""
+                        INSERT INTO {self.table_name}
+                        (id, timestamp, data, hash, previous_hash, signature, metadata, nonce)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        entry.id,
+                        entry.timestamp,
+                        Json(entry.data),
+                        entry.hash,
+                        entry.previous_hash,
+                        entry.signature,
+                        Json(entry.metadata) if entry.metadata else None,
+                        entry.nonce,
+                    ))
+                except psycopg2.IntegrityError as e:
+                    conn.rollback()
+                    if self._is_chain_violation(e):
+                        raise _ChainConflict(tip_seq)
+                    if 'duplicate key value violates unique constraint' in str(e):
+                        raise StorageError(f"Entry with ID {entry.id} already exists", "append", self.name)
+                    raise StorageError(f"Failed to append entry: {e}", "append", self.name)
+            conn.commit()
+            return entry
+        except (_ChainConflict, StorageError):
+            raise
+        except Exception as e:
+            conn.rollback()
+            if not isinstance(e, psycopg2.Error):
+                # Hashing or signing failed inside build_entry: not a storage fault.
+                raise
+            raise StorageError(f"Failed to append entry: {e}", "append", self.name)
+        finally:
+            self._put_connection(conn)
+
+    def _append_chained_sqlalchemy(self, build_entry: Callable[[Optional[str]], Entry]) -> Entry:
+        from sqlalchemy.exc import IntegrityError as SAIntegrityError
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(
+                    text("SELECT pg_advisory_xact_lock(:k)"),
+                    {"k": self.advisory_lock_key()},
+                )
+                row = conn.execute(text(
+                    f"SELECT hash, seq FROM {self.table_name} ORDER BY seq DESC LIMIT 1"
+                )).first()
+                previous_hash, tip_seq = (row[0], row[1]) if row else (None, None)
+                entry = build_entry(previous_hash)
+                try:
+                    with conn.begin_nested():
+                        conn.execute(self._table.insert().values(
+                            id=entry.id,
+                            timestamp=entry.timestamp,
+                            data=entry.data,
+                            hash=entry.hash,
+                            previous_hash=entry.previous_hash,
+                            signature=entry.signature,
+                            metadata=entry.metadata,
+                            nonce=entry.nonce,
+                        ))
+                except SAIntegrityError as e:
+                    if self._is_chain_violation(e):
+                        raise _ChainConflict(tip_seq)
+                    raise StorageError(f"Failed to append entry: {e}", "append", self.name)
+            return entry
+        except (_ChainConflict, StorageError):
+            raise
+        except SAIntegrityError as e:
+            raise StorageError(f"Failed to append entry: {e}", "append", self.name)
 
     def append_entry(self, entry: Entry) -> None:
         """Append entry to the ledger."""
