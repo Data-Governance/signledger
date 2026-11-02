@@ -200,14 +200,64 @@ def test_other_database_error_becomes_storage_error():
     assert ("rollback",) in conn.events
 
 
-def test_chain_unique_index_ddl_is_idempotent_and_covers_genesis():
+def test_chain_unique_index_ddl_is_partial_and_idempotent():
     be = make_backend([])
     captured = []
     be._execute_ddl = lambda stmts: captured.extend(stmts)
+    be._warn_on_multiple_genesis_rows = lambda: None
     be._create_chain_unique_index()
     (stmt,) = captured
     assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_entries_previous_hash" in stmt
-    assert "COALESCE(previous_hash, 'GENESIS')" in stmt
+    assert "ON ledger_entries (previous_hash)" in stmt
+    assert "WHERE previous_hash IS NOT NULL" in stmt
+    assert "COALESCE" not in stmt
+
+
+def test_count_genesis_rows_reads_null_previous_hash_count():
+    conn = FakeConn()
+    conn.count_row = (3,)
+    be = make_backend([conn])
+    orig = FakeCursor.fetchone
+    try:
+        FakeCursor.fetchone = lambda self: self.conn.count_row
+        assert be._count_genesis_rows() == 3
+    finally:
+        FakeCursor.fetchone = orig
+    executed = [e for e in conn.events if e[0] == "execute"]
+    assert "previous_hash IS NULL" in executed[0][1]
+    assert ("commit",) in conn.events
+
+
+def test_warn_on_multiple_genesis_rows_logs_count_over_one(caplog):
+    be = make_backend([])
+    be._count_genesis_rows = lambda: 4
+    with caplog.at_level(logging.WARNING, logger="signledger.backends.postgresql"):
+        be._warn_on_multiple_genesis_rows()
+    assert any(
+        "4 genesis rows" in r.getMessage() and "verify_integrity reports them" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_warn_on_multiple_genesis_rows_silent_for_zero_or_one(caplog):
+    be = make_backend([])
+    with caplog.at_level(logging.WARNING, logger="signledger.backends.postgresql"):
+        for n in (0, 1):
+            be._count_genesis_rows = lambda n=n: n
+            be._warn_on_multiple_genesis_rows()
+    assert caplog.records == []
+
+
+def test_warn_on_multiple_genesis_rows_never_fails_boot(caplog):
+    be = make_backend([])
+
+    def boom():
+        raise psycopg2.OperationalError("count failed")
+
+    be._count_genesis_rows = boom
+    with caplog.at_level(logging.WARNING, logger="signledger.backends.postgresql"):
+        be._warn_on_multiple_genesis_rows()
+    assert any("could not count genesis rows" in r.getMessage() for r in caplog.records)
 
 
 # SQLAlchemy configuration -------------------------------------------------
@@ -366,3 +416,71 @@ def test_two_appenders_real_postgres_keep_a_single_chain():
     assert len(entries) == 50
     assert len({e.previous_hash for e in entries}) == 50
     assert ledgers[0].verify_integrity() is True
+
+
+def _insert_raw_row(dsn, table, previous_hash):
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {table} (id, timestamp, data, hash, previous_hash) "
+                "VALUES (%s, now(), '{}'::jsonb, %s, %s)",
+                (str(uuid.uuid4()), uuid.uuid4().hex + uuid.uuid4().hex, previous_hash),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("SIGNLEDGER_TEST_PG_DSN"),
+    reason="set SIGNLEDGER_TEST_PG_DSN to a disposable PostgreSQL database",
+)
+def test_boot_succeeds_with_several_genesis_rows_and_warns_real_postgres(caplog):
+    dsn = os.environ["SIGNLEDGER_TEST_PG_DSN"]
+    table = f"sl_genesis_{uuid.uuid4().hex[:8]}"
+    first = PostgreSQLBackend(dsn, table_name=table)
+    first.close()
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"DROP INDEX IF EXISTS uq_{table}_previous_hash")
+        conn.commit()
+    finally:
+        conn.close()
+    _insert_raw_row(dsn, table, None)
+    _insert_raw_row(dsn, table, None)
+
+    with caplog.at_level(logging.WARNING, logger="signledger.backends.postgresql"):
+        second = PostgreSQLBackend(dsn, table_name=table)
+    try:
+        assert any("2 genesis rows" in r.getMessage() for r in caplog.records)
+        conn = psycopg2.connect(dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT indexdef FROM pg_indexes WHERE indexname = %s",
+                    (f"uq_{table}_previous_hash",),
+                )
+                assert "WHERE (previous_hash IS NOT NULL)" in cur.fetchone()[0]
+        finally:
+            conn.close()
+    finally:
+        second.close()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("SIGNLEDGER_TEST_PG_DSN"),
+    reason="set SIGNLEDGER_TEST_PG_DSN to a disposable PostgreSQL database",
+)
+def test_same_non_null_previous_hash_still_fails_the_index_real_postgres():
+    dsn = os.environ["SIGNLEDGER_TEST_PG_DSN"]
+    table = f"sl_fork_{uuid.uuid4().hex[:8]}"
+    backend = PostgreSQLBackend(dsn, table_name=table)
+    try:
+        _insert_raw_row(dsn, table, "a" * 64)
+        with pytest.raises(psycopg2.errors.UniqueViolation) as exc:
+            _insert_raw_row(dsn, table, "a" * 64)
+        assert exc.value.diag.constraint_name == f"uq_{table}_previous_hash"
+    finally:
+        backend.close()
