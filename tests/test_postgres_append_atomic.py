@@ -205,6 +205,7 @@ def test_chain_unique_index_ddl_is_partial_and_idempotent():
     captured = []
     be._execute_ddl = lambda stmts: captured.extend(stmts)
     be._warn_on_multiple_genesis_rows = lambda: None
+    be._count_fork_groups = lambda: 0
     be._create_chain_unique_index()
     (stmt,) = captured
     assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_entries_previous_hash" in stmt
@@ -484,3 +485,187 @@ def test_same_non_null_previous_hash_still_fails_the_index_real_postgres():
         assert exc.value.diag.constraint_name == f"uq_{table}_previous_hash"
     finally:
         backend.close()
+
+
+# Legacy forks (dev outage 2026-11-02) ---------------------------------------
+
+FORK_WARNING_TEXT = "was NOT created; verify_integrity reports the forks"
+
+
+def _stub_rows(be, mapping):
+    def rows(sql):
+        for key, value in mapping.items():
+            if key in sql:
+                return value
+        raise AssertionError(f"unexpected sql {sql}")
+    be._query_rows = rows
+
+
+def test_count_fork_groups_counts_shared_previous_hash_groups():
+    be = make_backend([])
+    seen = []
+    be._query_rows = lambda sql: seen.append(sql) or [(2,)]
+    assert be._count_fork_groups() == 2
+    assert "GROUP BY previous_hash HAVING COUNT(*) > 1" in seen[0]
+    assert "previous_hash IS NOT NULL" in seen[0]
+
+
+def test_query_rows_psycopg2_returns_rows_and_commits():
+    conn = FakeConn()
+    be = make_backend([conn])
+    orig = FakeCursor.fetchall if hasattr(FakeCursor, "fetchall") else None
+    FakeCursor.fetchall = lambda self: [("a",), ("b",)]
+    try:
+        assert be._query_rows("SELECT 1") == [("a",), ("b",)]
+    finally:
+        if orig is None:
+            del FakeCursor.fetchall
+        else:
+            FakeCursor.fetchall = orig
+    assert ("commit",) in conn.events
+    assert be._pool.returned == [conn]
+
+
+def test_query_rows_psycopg2_rolls_back_and_raises():
+    conn = FakeConn()
+    be = make_backend([conn])
+
+    def boom(self):
+        raise psycopg2.OperationalError("read failed")
+
+    FakeCursor.fetchall = boom
+    try:
+        with pytest.raises(psycopg2.OperationalError):
+            be._query_rows("SELECT 1")
+    finally:
+        del FakeCursor.fetchall
+    assert ("rollback",) in conn.events
+    assert be._pool.returned == [conn]
+
+
+def test_fork_present_logs_warning_skips_index(caplog):
+    be = make_backend([])
+    captured = []
+    be._execute_ddl = lambda stmts: captured.extend(stmts)
+    be._warn_on_multiple_genesis_rows = lambda: None
+    be._count_fork_groups = lambda: 2
+    _stub_rows(be, {"LIMIT 3": [("h1",), ("h2",)]})
+    with caplog.at_level(logging.WARNING, logger="signledger.backends.postgresql"):
+        be._create_chain_unique_index()
+    assert captured == []
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(
+        "2 forked previous_hash" in m and "h1, h2" in m and FORK_WARNING_TEXT in m
+        and INDEX in m
+        for m in msgs
+    )
+
+
+def test_fork_warning_survives_failing_hash_listing(caplog):
+    be = make_backend([])
+
+    def boom(sql):
+        raise psycopg2.OperationalError("list failed")
+
+    be._query_rows = boom
+    with caplog.at_level(logging.WARNING, logger="signledger.backends.postgresql"):
+        be._warn_chain_index_skipped(1)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("could not list forked hashes" in m for m in msgs)
+    assert any(FORK_WARNING_TEXT in m for m in msgs)
+
+
+def test_unique_violation_during_create_becomes_warning(caplog):
+    be = make_backend([])
+    counts = iter([0, 1])
+    be._count_fork_groups = lambda: next(counts)
+    be._warn_on_multiple_genesis_rows = lambda: None
+    _stub_rows(be, {"LIMIT 3": [("hx",)]})
+
+    def raising(stmts):
+        raise psycopg2.errors.UniqueViolation("dup")
+
+    be._execute_ddl = raising
+    with caplog.at_level(logging.WARNING, logger="signledger.backends.postgresql"):
+        be._create_chain_unique_index()
+    assert any(FORK_WARNING_TEXT in r.getMessage() for r in caplog.records)
+
+
+def test_other_ddl_error_still_fails_boot():
+    be = make_backend([])
+    be._count_fork_groups = lambda: 0
+
+    def raising(stmts):
+        raise psycopg2.OperationalError("no privilege")
+
+    be._execute_ddl = raising
+    with pytest.raises(psycopg2.OperationalError):
+        be._create_chain_unique_index()
+
+
+def test_is_unique_violation_sees_wrapped_orig():
+    wrapped = SimpleNamespace(orig=psycopg2.errors.UniqueViolation("x"))
+    assert PostgreSQLBackend._is_unique_violation(wrapped) is True
+    assert PostgreSQLBackend._is_unique_violation(ValueError("x")) is False
+
+
+def test_execute_ddl_psycopg2_rolls_back_on_failure():
+    class BadCursor(FakeCursor):
+        def execute(self, sql, params=None):
+            raise psycopg2.errors.UniqueViolation("dup")
+
+    conn = FakeConn()
+    conn.cursor = lambda: BadCursor(conn)
+    be = make_backend([conn])
+    with pytest.raises(psycopg2.errors.UniqueViolation):
+        be._execute_ddl(["CREATE UNIQUE INDEX x"])
+    assert ("rollback",) in conn.events
+    assert be._pool.returned == [conn]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("SIGNLEDGER_TEST_PG_DSN"),
+    reason="set SIGNLEDGER_TEST_PG_DSN to a disposable PostgreSQL database",
+)
+@pytest.mark.parametrize("use_sqlalchemy", [False, True])
+@pytest.mark.parametrize("with_fork", [True, False])
+def test_boot_with_and_without_fork_real_postgres(caplog, with_fork, use_sqlalchemy):
+    dsn = os.environ["SIGNLEDGER_TEST_PG_DSN"]
+    table = f"sl_fork_{uuid.uuid4().hex[:8]}"
+    first = PostgreSQLBackend(dsn, table_name=table)
+    first.close()
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"DROP INDEX IF EXISTS uq_{table}_previous_hash")
+        conn.commit()
+    finally:
+        conn.close()
+    _insert_raw_row(dsn, table, None)
+    _insert_raw_row(dsn, table, "p" * 64)
+    if with_fork:
+        _insert_raw_row(dsn, table, "p" * 64)
+
+    with caplog.at_level(logging.WARNING, logger="signledger.backends.postgresql"):
+        second = PostgreSQLBackend(
+            dsn.replace("postgresql://", "postgresql+psycopg2://", 1)
+            if use_sqlalchemy else dsn,
+            table_name=table,
+            use_sqlalchemy=use_sqlalchemy,
+        )
+    try:
+        conn = psycopg2.connect(dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM pg_indexes WHERE indexname = %s",
+                    (f"uq_{table}_previous_hash",),
+                )
+                indexes = cur.fetchone()[0]
+        finally:
+            conn.close()
+        warned = any(FORK_WARNING_TEXT in r.getMessage() for r in caplog.records)
+        assert indexes == (0 if with_fork else 1)
+        assert warned is with_fork
+    finally:
+        second.close()

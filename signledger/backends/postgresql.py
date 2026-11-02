@@ -10,6 +10,7 @@ from typing import Callable
 
 try:
     import psycopg2
+    import psycopg2.errors
     from psycopg2.extras import RealDictCursor, Json
     from psycopg2.pool import SimpleConnectionPool
     HAS_PSYCOPG2 = True
@@ -226,6 +227,9 @@ class PostgreSQLBackend(StorageBackend):
                     for stmt in statements:
                         cur.execute(stmt)
                 conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
             finally:
                 self._put_connection(conn)
 
@@ -412,18 +416,89 @@ class PostgreSQLBackend(StorageBackend):
         The advisory lock in append_chained still serialises appends, and
         verify_integrity reports extra chain starts.
 
+        Legacy forks: a table written before the advisory lock existed may hold
+        two or more rows sharing one previous_hash. An append-only ledger is
+        never rewritten, so boot must not depend on clean history. When such
+        duplicates exist the index is NOT created, a WARNING names the count and
+        up to three hashes, and verify_integrity reports the forks. New appends
+        stay serialised by pg_advisory_xact_lock; the unique-index retry path
+        in append_chained simply never fires while the index is absent. A
+        UniqueViolation from the CREATE itself (a fork written between the
+        count and the create) becomes the same WARNING.
+
         Idempotent. An older COALESCE(previous_hash, 'GENESIS') index, if one
         exists under the same name, is left as is (it can only exist where it
         was created successfully, i.e. a single genesis row). After creating
         the index, boot logs a WARNING when more than one genesis row exists;
         that never fails boot.
         """
-        self._execute_ddl([
-            f"CREATE UNIQUE INDEX IF NOT EXISTS {self.chain_index_name} "
-            f"ON {self.table_name} (previous_hash) "
-            f"WHERE previous_hash IS NOT NULL"
-        ])
+        forks = self._count_fork_groups()
+        if forks > 0:
+            self._warn_chain_index_skipped(forks)
+        else:
+            try:
+                self._execute_ddl([
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {self.chain_index_name} "
+                    f"ON {self.table_name} (previous_hash) "
+                    f"WHERE previous_hash IS NOT NULL"
+                ])
+            except Exception as exc:  # noqa: BLE001 - narrowed just below
+                if not self._is_unique_violation(exc):
+                    raise
+                self._warn_chain_index_skipped(max(self._count_fork_groups(), 1))
         self._warn_on_multiple_genesis_rows()
+
+    @staticmethod
+    def _is_unique_violation(exc: Exception) -> bool:
+        orig = getattr(exc, "orig", exc)
+        return isinstance(orig, psycopg2.errors.UniqueViolation)
+
+    def _query_rows(self, sql: str) -> list:
+        """Run a read-only query and return all rows, on either configuration."""
+        if self.use_sqlalchemy:
+            with self._engine.begin() as conn:
+                return [tuple(r) for r in conn.execute(text(sql)).fetchall()]
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            conn.commit()
+            return [tuple(r) for r in rows]
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._put_connection(conn)
+
+    def _count_fork_groups(self) -> int:
+        """Number of previous_hash values shared by more than one row."""
+        rows = self._query_rows(
+            f"SELECT COUNT(*) FROM (SELECT previous_hash FROM {self.table_name} "
+            f"WHERE previous_hash IS NOT NULL GROUP BY previous_hash "
+            f"HAVING COUNT(*) > 1) d"
+        )
+        return int(rows[0][0])
+
+    def _warn_chain_index_skipped(self, forks: int) -> None:
+        """Log the legacy-fork WARNING; never raises."""
+        try:
+            sample = [
+                r[0] for r in self._query_rows(
+                    f"SELECT previous_hash FROM {self.table_name} "
+                    f"WHERE previous_hash IS NOT NULL GROUP BY previous_hash "
+                    f"HAVING COUNT(*) > 1 ORDER BY previous_hash LIMIT 3"
+                )
+            ]
+        except Exception as exc:  # noqa: BLE001 - diagnostic only
+            logger.warning("could not list forked hashes in %s: %s", self.table_name, exc)
+            sample = []
+        logger.warning(
+            "%d forked previous_hash value(s) in %s (e.g. %s): the chain-lock "
+            "index %s was NOT created; verify_integrity reports the forks",
+            forks, self.table_name, ", ".join(sample) or "unavailable",
+            self.chain_index_name,
+        )
 
     def _count_genesis_rows(self) -> int:
         """Number of rows with previous_hash IS NULL (chain starts)."""
