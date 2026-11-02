@@ -404,18 +404,61 @@ class PostgreSQLBackend(StorageBackend):
     def _create_chain_unique_index(self) -> None:
         """Make a fork impossible at the database (SEC-SWEEP-2 item 24).
 
-        UNIQUE on COALESCE(previous_hash, 'GENESIS'): every non-genesis entry
-        may be the predecessor of exactly one row, and the genesis row (stored
-        with previous_hash NULL, which a plain unique index would let repeat)
-        is unique too. A real hash is 64 hex characters, so the sentinel cannot
-        collide. One ledger per table, so no per-ledger scoping is needed.
-        Idempotent. On a table that already holds a fork this raises at boot,
-        which is the correct outcome: the chain needs a human.
+        Partial UNIQUE index on previous_hash WHERE previous_hash IS NOT NULL:
+        every non-genesis entry may be the predecessor of exactly one row, so a
+        second successor of one entry (a fork) is rejected by the database.
+        Genesis rows (previous_hash NULL) are deliberately NOT constrained: a
+        table with several chain starts (historical resets) must still boot.
+        The advisory lock in append_chained still serialises appends, and
+        verify_integrity reports extra chain starts.
+
+        Idempotent. An older COALESCE(previous_hash, 'GENESIS') index, if one
+        exists under the same name, is left as is (it can only exist where it
+        was created successfully, i.e. a single genesis row). After creating
+        the index, boot logs a WARNING when more than one genesis row exists;
+        that never fails boot.
         """
         self._execute_ddl([
             f"CREATE UNIQUE INDEX IF NOT EXISTS {self.chain_index_name} "
-            f"ON {self.table_name} ((COALESCE(previous_hash, 'GENESIS')))"
+            f"ON {self.table_name} (previous_hash) "
+            f"WHERE previous_hash IS NOT NULL"
         ])
+        self._warn_on_multiple_genesis_rows()
+
+    def _count_genesis_rows(self) -> int:
+        """Number of rows with previous_hash IS NULL (chain starts)."""
+        sql = f"SELECT COUNT(*) FROM {self.table_name} WHERE previous_hash IS NULL"
+        if self.use_sqlalchemy:
+            with self._engine.begin() as conn:
+                return int(conn.execute(text(sql)).scalar())
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                row = cur.fetchone()
+            conn.commit()
+            return int(row[0])
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._put_connection(conn)
+
+    def _warn_on_multiple_genesis_rows(self) -> None:
+        """Log a WARNING when the table holds several chain starts; never raise."""
+        try:
+            count = self._count_genesis_rows()
+        except Exception as exc:  # noqa: BLE001 - boot must not fail on a diagnostic
+            logger.warning(
+                "could not count genesis rows in %s: %s", self.table_name, exc
+            )
+            return
+        if count > 1:
+            logger.warning(
+                "%d genesis rows: the table %s holds several chain starts; "
+                "verify_integrity reports them",
+                count, self.table_name,
+            )
 
     def append_chained(self, build_entry: Callable[[Optional[str]], Entry]) -> Entry:
         """Read the tip and insert the successor in ONE transaction.
